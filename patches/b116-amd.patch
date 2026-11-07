@@ -1,0 +1,1820 @@
+From 8c3971d960ed237148c46327b38c3b05b796fba5 Mon Sep 17 00:00:00 2001
+From: Nau Fantom <353563530+nauxph@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:10:31 -0300
+Subject: [PATCH 1/2] perf: copy occlusion results after one barrier on AMD,
+ not a wait per query
+
+SamplesStreamer::PresyncWrites copied each bank's occlusion results with
+VK_QUERY_RESULT_WAIT_BIT. AMD's Windows driver spends about 22 us per
+query on that wait, and Ocarina of Time resolves about 2,000 queries a
+frame: 45 ms of a 61 ms GPU frame at the Kokiri village sign (RX 9070 XT,
+driver 2.0.395, GPU Fast, docked 1440p).
+
+On AMD drivers, one ALL_COMMANDS -> TRANSFER barrier before the copies now
+orders them after every earlier command, including the vkCmdEndQuery that
+made each query available, and the copies run without the wait: 0.4 ms a
+frame. Other drivers were not measured and keep the wait.
+
+Same scene and session, three 600-frame windows each, no frame trace:
+            before   after
+  fps        19.7     34.7
+  p50 ms     50.5     28.7
+  p95 ms     55.9     34.2
+  p99 ms     66.0     42.0
+  1% low     15.2     23.9 fps
+No flashes, missing objects or flicker while switching live, and the
+screenshots match. With EDEN_DKB_FRAME_TRACE=1, a DKB query_copies line
+logs the copies per second.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_query_cache.cpp        | 82 ++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 4d61dd80..83b4629b 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <chrono>
+ #include <cstddef>
+ #include <limits>
+ #include <map>
+@@ -16,6 +17,7 @@
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
++#include "common/dkb_frame_trace.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/query_cache/frame_trace.h"
+@@ -270,6 +272,34 @@ public:
+         size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
+         resolve_buffers.push_back(resolve_buffer_index);
+         size_t base_offset = 0;
++        size_t copies = 0;
++        size_t copied_slots = 0;
++        size_t max_copy = 0;
++
++        // Every query copied below was ended by an earlier command. On AMD an execution dependency
++        // on all prior commands (VK_PIPELINE_STAGE_ALL_COMMANDS_BIT covers the operation of
++        // vkCmdEndQuery, which makes a query available) replaces VK_QUERY_RESULT_WAIT_BIT: AMD's
++        // Windows driver spends ~22 us per query on that wait, 45 ms of a 61 ms GPU frame at
++        // Ocarina of Time's ~2,000 queries a frame, 0.4 ms this way. Other drivers were not
++        // measured and keep the wait.
++        const bool copy_after_barrier = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
++                                        driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
++        if (copy_after_barrier) {
++            scheduler.RequestOutsideRenderPassOperationContext();
++            scheduler.Record([](vk::CommandBuffer cmdbuf) {
++                static constexpr VkMemoryBarrier PRIOR_COMMANDS{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .pNext = nullptr,
++                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                };
++                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, PRIOR_COMMANDS);
++            });
++        }
++        const VkQueryResultFlags copy_flags =
++            copy_after_barrier ? VK_QUERY_RESULT_64_BIT
++                               : VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT;
+ 
+         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
+                                                  size_t amount) {
+@@ -277,7 +307,7 @@ public:
+             auto& resolve_buffer = buffers[resolve_buffer_index];
+             VkQueryPool query_pool = bank->GetInnerPool();
+             scheduler.RequestOutsideRenderPassOperationContext();
+-            scheduler.Record([start, amount, base_offset, query_pool,
++            scheduler.Record([start, amount, base_offset, query_pool, copy_flags,
+                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
+                 const VkBufferMemoryBarrier copy_query_pool_barrier{
+                     .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+@@ -293,13 +323,15 @@ public:
+ 
+                 cmdbuf.CopyQueryPoolResults(
+                     query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
+-                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
+-                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
++                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE, copy_flags);
+                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_query_pool_barrier);
+             });
+             offsets[bank_id] = {start, base_offset};
+             base_offset += amount * SamplesQueryBank::QUERY_SIZE;
++            ++copies;
++            copied_slots += amount;
++            max_copy = (std::max)(max_copy, amount);
+         });
+ 
+         // Convert queries
+@@ -349,6 +381,9 @@ public:
+             });
+         }
+ 
++        if (Common::DkbFrameTrace::Enabled()) {
++            TraceCopies(copies, copied_slots, max_copy, pending_sync.size(), has_multi_queries);
++        }
+         ReplicateCurrentQueryIfNeeded();
+         std::function<void()> func([this] { amend_value = accumulation_value; });
+         rasterizer->SyncOperation(std::move(func));
+@@ -451,6 +486,47 @@ private:
+             size_slots -= amount;
+         }
+     }
++
++    /// EDEN_DKB_FRAME_TRACE: what PresyncWrites copied, summed and logged once a second.
++    void TraceCopies(size_t copies, size_t slots, size_t max_copy, size_t queries, bool multi) {
++        CopyStats& stats = copy_stats;
++        ++stats.syncs;
++        stats.copies += copies;
++        stats.slots += slots;
++        stats.queries += queries;
++        stats.multi += multi ? 1 : 0;
++        stats.max_copy = (std::max)(stats.max_copy, max_copy);
++        const auto now = std::chrono::steady_clock::now();
++        if (stats.start == std::chrono::steady_clock::time_point{}) {
++            stats.start = now;
++            return;
++        }
++        const double seconds = std::chrono::duration<double>(now - stats.start).count();
++        if (seconds < 1.0) {
++            return;
++        }
++        LOG_INFO(Render_Vulkan,
++                 "DKB query_copies per_s: syncs={:.0f} copies={:.0f} slots={:.0f} "
++                 "queries={:.0f} multi={:.0f} max_slots_per_copy={}",
++                 static_cast<double>(stats.syncs) / seconds,
++                 static_cast<double>(stats.copies) / seconds,
++                 static_cast<double>(stats.slots) / seconds,
++                 static_cast<double>(stats.queries) / seconds,
++                 static_cast<double>(stats.multi) / seconds, stats.max_copy);
++        stats = CopyStats{.start = now};
++    }
++
++    struct CopyStats {
++        std::chrono::steady_clock::time_point start{};
++        u64 syncs{};
++        u64 copies{};
++        u64 slots{};
++        u64 queries{};
++        u64 multi{};
++        size_t max_copy{};
++    };
++    CopyStats copy_stats;
++
+     TextureCache& texture_cache;
+     template <bool is_ordered, typename Func>
+     void ApplyBanksWideOp(std::vector<size_t>& queries, Func&& func) {
+-- 
+2.43.0
+
+
+From eb78d0b5f4bbfec75b74ce017a891719a4d01b3e Mon Sep 17 00:00:00 2001
+From: Nau Fantom <353563530+nauxph@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 17:05:19 -0300
+Subject: [PATCH 2/2] fix: Ocarina HUD flicker, green fog and movie sync on AMD
+
+Local Lichii build for The Legend of Zelda: Ocarina of Time (0400486024DEC000)
+on an RX 9070 XT (AMD proprietary driver), on top of nx2 588bfa611b.
+
+Ported pull requests:
+- #292 bind compute table pointers up to 256 MiB. The fog classifier
+  (75d4369f3b1f5868) reads its light probes ~110 MiB past their pointer.
+  Past the 64 MiB cap NVIDIA read zeros (white haze) and AMD read garbage,
+  which turned the sky, the fog and the water reflections neon green.
+- #251 Ocarina movie clock: late decoded frames are skipped so movies keep
+  time with their sound below 60 fps.
+- #278 EDEN_NX2_FS_READ_MBPS: configurable IStorage read throttle (0 = off).
+- #204 and #215: macro DMA reads wait for pending query results.
+- #243 macro DMA reads on the split front without draining the back.
+  EDEN_NX2_DMA_EARLY=0 turns the early reads off.
+- #268 texture cache: large cards fill 5/8 of their budget before collecting.
+- #259 opt-in EDEN_NX2_PREFLUSH=1.
+
+Own changes:
+- EDEN_NX2_RP_BARRIER=1: a full memory barrier before and after every render
+  pass. Ocarina's minimap, hearts and dialogs vanished on about half of the
+  frames on AMD although their draws ran in every frame (counted with
+  EDEN_NX2_WATCH_SHADERS); with the barrier 0 of 40 frames lost them, at no
+  visible frame-rate cost. Enabled through nx2_switches.txt; the exact
+  missing dependency is still to be narrowed down.
+- Draw texture blits now draw in the scheduler's render pass, keep the source
+  image in GENERAL and invalidate the tracked state afterwards.
+  EDEN_NX2_DRAW_TEXTURE_OLD=1 keeps the previous path.
+- Fence acquires suspend the channel until the syncpoint is reached, giving
+  up after 250 ms. EDEN_NX2_FENCE_WAIT=0 keeps the previous behaviour.
+- Diagnostics: EDEN_NX2_WATCH_SHADERS (per-frame draw counts for the given
+  shaders) and EDEN_NX2_IGNORE_RENDER_ENABLE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer/command/data_source/decode.cpp   |   5 +
+ src/audio_core/renderer/system.cpp            |   9 +
+ src/audio_core/sink/sink_stream.cpp           |   8 +
+ src/common/CMakeLists.txt                     |   1 +
+ src/common/nx2_movie_clock.h                  |  41 ++++
+ .../service/filesystem/fsp/fs_i_storage.cpp   |  23 ++-
+ src/core/hle/service/nx2_gsv.h                | 132 +++++++++++-
+ src/video_core/buffer_cache/buffer_cache.h    |  28 ++-
+ .../buffer_cache/buffer_cache_base.h          |   3 +-
+ src/video_core/dma_pusher.cpp                 |  14 ++
+ src/video_core/engines/draw_manager.cpp       |   7 +
+ src/video_core/engines/maxwell_3d.cpp         | 193 ++++++++++++++++++
+ src/video_core/engines/maxwell_3d.h           |   5 +
+ src/video_core/engines/puller.cpp             |  91 ++++++++-
+ src/video_core/engines/puller.h               |   4 +-
+ src/video_core/gpu_split.cpp                  |  83 ++++++++
+ src/video_core/gpu_split.h                    |  96 +++++++++
+ src/video_core/nx2.h                          |  22 ++
+ src/video_core/query_cache/query_cache.h      |  11 +
+ src/video_core/renderer_vulkan/blit_image.cpp |  52 +++++
+ .../renderer_vulkan/vk_buffer_cache.h         |   4 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |  39 ++++
+ .../renderer_vulkan/vk_scheduler.cpp          |  34 ++-
+ src/video_core/texture_cache/texture_cache.h  |  14 +-
+ .../texture_cache/texture_cache_base.h        |   4 +-
+ 25 files changed, 893 insertions(+), 30 deletions(-)
+ create mode 100644 src/common/nx2_movie_clock.h
+
+diff --git a/src/audio_core/renderer/command/data_source/decode.cpp b/src/audio_core/renderer/command/data_source/decode.cpp
+index 0f6f7825..673c11f3 100644
+--- a/src/audio_core/renderer/command/data_source/decode.cpp
++++ b/src/audio_core/renderer/command/data_source/decode.cpp
+@@ -11,6 +11,7 @@
+ #include "audio_core/renderer/command/resample/resample.h"
+ #include "common/fixed_point.h"
+ #include "common/logging.h"
++#include "common/nx2_movie_clock.h"
+ #include "common/scratch_buffer.h"
+ #include "core/guest_memory.h"
+ #include "core/memory.h"
+@@ -338,6 +339,10 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
+             }
+ 
+             played_sample_count += samples_decoded;
++            if (Common::Nx2MovieClock::Enabled()) {
++                Common::Nx2MovieClock::Add(Common::Nx2MovieClock::Get().voice_samples,
++                                           static_cast<u64>(samples_decoded));
++            }
+             samples_read += samples_decoded;
+             temp_buffer_pos += samples_decoded;
+             offset += samples_decoded;
+diff --git a/src/audio_core/renderer/system.cpp b/src/audio_core/renderer/system.cpp
+index 2e3e741d..14e453ad 100644
+--- a/src/audio_core/renderer/system.cpp
++++ b/src/audio_core/renderer/system.cpp
+@@ -32,6 +32,7 @@
+ #include "audio_core/renderer/voice/voice_info.h"
+ #include "audio_core/renderer/voice/voice_state.h"
+ #include "common/alignment.h"
++#include "common/nx2_movie_clock.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #include "core/hle/kernel/k_event.h"
+@@ -453,6 +454,9 @@ void System::Stop() {
+ 
+ Result System::Update(std::span<const u8> input, std::span<u8> performance, std::span<u8> output) {
+     std::scoped_lock l{lock};
++    if (Common::Nx2MovieClock::Enabled()) {
++        Common::Nx2MovieClock::Add(Common::Nx2MovieClock::Get().renderer_updates, 1);
++    }
+ 
+     const auto start_time{core.CoreTiming().GetGlobalTimeNs().count()};
+     std::memset(output.data(), 0, output.size());
+@@ -743,6 +747,11 @@ u64 System::GenerateCommand(std::span<u8> in_command_buffer,
+     num_command_lists_generated++;
+     render_start_tick = audio_renderer.GetRenderingStartTick(session_id);
+     frames_elapsed++;
++    if (Common::Nx2MovieClock::Enabled()) {
++        auto& clock = Common::Nx2MovieClock::Get();
++        Common::Nx2MovieClock::Add(clock.renderer_passes, 1);
++        Common::Nx2MovieClock::Add(clock.voices_dropped, static_cast<u64>(num_voices_dropped));
++    }
+ 
+     return command_buffer.size;
+ }
+diff --git a/src/audio_core/sink/sink_stream.cpp b/src/audio_core/sink/sink_stream.cpp
+index 45c72dd4..c06e32c5 100644
+--- a/src/audio_core/sink/sink_stream.cpp
++++ b/src/audio_core/sink/sink_stream.cpp
+@@ -18,6 +18,7 @@
+ #include "audio_core/sink/sink_stream.h"
+ #include "common/common_types.h"
+ #include "common/fixed_point.h"
++#include "common/nx2_movie_clock.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -250,6 +251,13 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
+ 
+     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+ 
++    if (type == StreamType::Render && Common::Nx2MovieClock::Enabled()) {
++        auto& clock = Common::Nx2MovieClock::Get();
++        const size_t index = !name.empty() && name.back() == '1' ? 1 : 0;
++        Common::Nx2MovieClock::Add(clock.sink_frames[index], num_frames);
++        Common::Nx2MovieClock::Add(clock.sink_padded[index], num_frames - actual_frames_written);
++    }
++
+     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
+     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;
+         meter || type == StreamType::Sysmix) {
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 02b05464..da7cbb6e 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -49,6 +49,7 @@ add_library(
+     dkb_cpu_trace.h
+     nx2_sampler.cpp
+     nx2_sampler.h
++    nx2_movie_clock.h
+     dynamic_library.cpp
+     dynamic_library.h
+     elf.h
+diff --git a/src/common/nx2_movie_clock.h b/src/common/nx2_movie_clock.h
+new file mode 100644
+index 00000000..372840f2
+--- /dev/null
++++ b/src/common/nx2_movie_clock.h
+@@ -0,0 +1,41 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstdlib>
++
++#include "common/common_types.h"
++
++// EDEN_NX2_MOVIE_CLOCK=1: per-second counts of video, audio and clock progress.
++namespace Common::Nx2MovieClock {
++
++inline bool Enabled() {
++    static const bool enabled = std::getenv("EDEN_NX2_MOVIE_CLOCK") != nullptr;
++    return enabled;
++}
++
++struct Counters {
++    std::atomic<u64> video_takes{};
++    std::atomic<u64> video_releases{};
++    std::atomic<u64> take_to_release_us{}; // sum over releases
++    std::atomic<u64> video_last_pts_us{};
++    std::atomic<u64> renderer_updates{};
++    std::atomic<u64> renderer_passes{};
++    std::atomic<u64> voices_dropped{};
++    std::atomic<u64> voice_samples{}; // decoded by all voices, at their own rates
++    std::atomic<u64> sink_frames[2]{};  // per render stream, sent to the host device
++    std::atomic<u64> sink_padded[2]{};  // of those, repeated or silent for lack of data
++};
++
++inline Counters& Get() {
++    static Counters counters;
++    return counters;
++}
++
++inline void Add(std::atomic<u64>& counter, u64 value) {
++    counter.fetch_add(value, std::memory_order_relaxed);
++}
++
++} // namespace Common::Nx2MovieClock
+diff --git a/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp b/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
+index 8541c178..f5cc114f 100644
+--- a/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
++++ b/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
+ #include <thread>
+ 
+ #include "core/file_sys/errors.h"
+@@ -35,13 +36,23 @@ Result IStorage::Read(
+     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
+     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
+ 
+-    const auto now = std::chrono::steady_clock::now();
+-    if (now < next_read_tick) {
+-        std::this_thread::sleep_for(next_read_tick - now);
++    // Custom (EDEN_NX2_FS_READ_MBPS=<n>): the emulated storage speed in MB/s for this read
++    // throttle (default 40). 0 turns it off. Ocarina of Time streams its opening video with
++    // hundreds of 64 KiB reads a second on the thread that also returns decoder images, so at
++    // 40 MB/s that thread sleeps most of the time and the video falls seconds behind its audio.
++    static const s64 bytes_per_second = [] {
++        const char* value = std::getenv("EDEN_NX2_FS_READ_MBPS");
++        return value != nullptr ? std::strtoll(value, nullptr, 10) * 1'000'000 : ReadBytesPerSecond;
++    }();
++    if (bytes_per_second > 0) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now < next_read_tick) {
++            std::this_thread::sleep_for(next_read_tick - now);
++        }
++        next_read_tick = std::chrono::steady_clock::now() +
++                         std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
++                                                  1'000'000'000 / bytes_per_second};
+     }
+-    next_read_tick = std::chrono::steady_clock::now() +
+-                     std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
+-                                              1'000'000'000 / ReadBytesPerSecond};
+ 
+     // Read the data from the Storage backend
+     backend->Read(out_bytes.data(), length, offset);
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index ce0219d3..08e565cc 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -29,6 +29,7 @@
+ #include "common/div_ceil.h"
+ #include "common/dkb_frame_trace.h"
+ #include "common/game_presets.h"
++#include "common/nx2_movie_clock.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "core/core.h"
+@@ -1882,11 +1883,56 @@ private:
+                 m_stats = {.last_present = entered};
+             }
+         }
++        if (Common::Nx2MovieClock::Enabled()) {
++            LogMovieClock(paced);
++        }
+         constexpr u64 AvailableSlots = 0x7fff;
+         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
+                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+     }
+ 
++    struct MovieClockState {
++        std::chrono::steady_clock::time_point wall{};
++        s64 guest_ns{};
++        u64 presents{};
++        std::array<u64, 12> counts{};
++    };
++    MovieClockState m_movie_clock{};
++
++    void LogMovieClock(std::chrono::steady_clock::time_point now) {
++        auto& c = Common::Nx2MovieClock::Get();
++        const auto load = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
++        const std::array<u64, 12> counts{
++            load(c.video_takes),    load(c.video_releases),   load(c.take_to_release_us),
++            load(c.renderer_updates), load(c.renderer_passes), load(c.voices_dropped),
++            load(c.voice_samples),  load(c.sink_frames[0]),    load(c.sink_padded[0]),
++            load(c.sink_frames[1]), load(c.sink_padded[1]),    0};
++        const s64 guest_ns = system.CoreTiming().GetGlobalTimeNs().count();
++        auto& last = m_movie_clock;
++        ++last.presents;
++        if (last.wall == std::chrono::steady_clock::time_point{}) {
++            last = {now, guest_ns, 0, counts};
++            return;
++        }
++        if (now - last.wall < std::chrono::seconds{1}) {
++            return;
++        }
++        std::array<u64, 12> d{};
++        for (size_t i = 0; i < d.size(); ++i) {
++            d[i] = counts[i] - last.counts[i];
++        }
++        const double wall_ms = std::chrono::duration<double, std::milli>(now - last.wall).count();
++        LOG_INFO(Service,
++                 "Nx2 movie clock: wall {:.1f} ms, guest {:.1f} ms | presents {} | video takes {} "
++                 "releases {} take->release {:.1f} ms, pts {:.3f} s | audio updates {} passes {} "
++                 "dropped {} voice samples {} | sink0 {} ({} padded) sink1 {} ({} padded)",
++                 wall_ms, static_cast<double>(guest_ns - last.guest_ns) / 1e6, last.presents,
++                 d[0], d[1], d[1] ? static_cast<double>(d[2]) / static_cast<double>(d[1]) / 1000.0 : 0.0,
++                 static_cast<double>(load(c.video_last_pts_us)) / 1e6, d[3], d[4], d[5], d[6], d[7],
++                 d[8], d[9], d[10]);
++        last = {now, guest_ns, 0, counts};
++    }
++
+     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
+     // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
+     // free, so pace the game here instead: wait (bounded, in case the GPU waits on the CPU) until
+@@ -2647,6 +2693,37 @@ private:
+         u32 value;
+     };
+ 
++    // Ocarina shows one movie frame per game frame: skip late ones on a real clock (m_mutex held).
++    static constexpr u64 OcarinaOfTimeMovieProgramId = 0x0400486024DEC000ULL;
++    static constexpr auto MovieClockPause = std::chrono::seconds{1};
++
++    bool SyncsToClock() {
++        return system.GetApplicationProcessProgramID() == OcarinaOfTimeMovieProgramId;
++    }
++
++    bool IsLate(u64 pts) const {
++        if (!m_clock_running) {
++            return false;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - m_clock_last_take > MovieClockPause) {
++            return false;
++        }
++        const auto elapsed =
++            std::chrono::duration_cast<std::chrono::microseconds>(now - m_clock_start).count();
++        const u64 due = m_clock_start_pts + static_cast<u64>((std::max<s64>)(elapsed, 0));
++        return pts + 2 * m_frame_us < due;
++    }
++
++    void EndMovieClock() {
++        if (m_late_dropped != 0) {
++            LOG_INFO(Service, "{} skipped {} late frames to keep the movie in time",
++                     GetServiceName(), m_late_dropped);
++        }
++        m_late_dropped = 0;
++        m_clock_running = false;
++    }
++
+     static constexpr u32 NoSyncpoint = ~0U;
+     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
+@@ -2732,6 +2809,8 @@ private:
+             m_codec = std::move(codec);
+             m_width = w[5];
+             m_height = w[6];
++            m_frame_us = w[7] != 0 && w[7] <= 240 ? u64{1'000'000} / w[7] : u64{1'000'000} / 60;
++            m_clock_running = false;
+         }
+         if (!m_worker.joinable()) {
+             m_worker = std::thread{[this] { DecodeLoop(); }};
+@@ -2824,6 +2903,16 @@ private:
+     void ReleaseBuffer(HLERequestContext& ctx) {
+         const auto* w = ctx.CommandBuffer();
+         Log(ctx, "release output");
++        if (Common::Nx2MovieClock::Enabled() &&
++            m_last_take != std::chrono::steady_clock::time_point{}) {
++            auto& clock = Common::Nx2MovieClock::Get();
++            Common::Nx2MovieClock::Add(clock.video_releases, 1);
++            Common::Nx2MovieClock::Add(
++                clock.take_to_release_us,
++                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                     std::chrono::steady_clock::now() - m_last_take)
++                                     .count()));
++        }
+         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
+         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
+     }
+@@ -2917,6 +3006,7 @@ private:
+                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
+             }
+             CompleteHandedFences();
++            EndMovieClock();
+         }
+         TipcReplyWords(ctx, {});
+     }
+@@ -2947,6 +3037,11 @@ private:
+             if (!m_outputs.empty()) {
+                 output = m_outputs.front();
+                 m_outputs.pop_front();
++                const auto now = std::chrono::steady_clock::now();
++                if (m_clock_running && now - m_clock_last_take > MovieClockPause) {
++                    m_clock_start += now - m_clock_last_take;
++                }
++                m_clock_last_take = now;
+             }
+         }
+         if (!output) {
+@@ -2959,6 +3054,12 @@ private:
+             rb.PushRaw<u32>(0x1c286f);
+             return;
+         }
++        if (Common::Nx2MovieClock::Enabled()) {
++            auto& clock = Common::Nx2MovieClock::Get();
++            Common::Nx2MovieClock::Add(clock.video_takes, 1);
++            clock.video_last_pts_us.store(output->pts, std::memory_order_relaxed);
++            m_last_take = std::chrono::steady_clock::now();
++        }
+         const u64 pts_ns = output->pts * 1000;
+         if (Nx2VideoTraceEnabled()) {
+             LOG_INFO(Service, "nx2:vdec trace output syncpoint={} image={} size={}x{} pts={} eos={}",
+@@ -2990,6 +3091,7 @@ private:
+             if (m_flush) {
+                 m_flush = false;
+                 m_decoded.clear();
++                EndMovieClock();
+                 if (decoder) {
+                     lk.unlock();
+                     decoder->Reset();
+@@ -2998,8 +3100,19 @@ private:
+                 continue;
+             }
+             if (!m_decoded.empty() && !m_free.empty()) {
++                while (m_decoded.size() > 1 && !m_decoded.front().end &&
++                       IsLate(m_decoded.front().pts)) {
++                    m_decoded.pop_front();
++                    ++m_late_dropped;
++                }
+                 Decoded frame = std::move(m_decoded.front());
+                 m_decoded.pop_front();
++                if (!m_clock_running && frame.picture && !frame.end && SyncsToClock()) {
++                    m_clock_running = true;
++                    m_clock_start = std::chrono::steady_clock::now();
++                    m_clock_last_take = m_clock_start;
++                    m_clock_start_pts = frame.pts;
++                }
+                 const u32 image = m_free.front();
+                 m_free.pop_front();
+                 std::optional<Fence> fence;
+@@ -3019,6 +3132,7 @@ private:
+                     m_stream_ended = true;
+                     m_end_queued = false;
+                     m_ready->room.store(false, std::memory_order_relaxed);
++                    EndMovieClock();
+                 }
+                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                 m_last_output = m_outputs.back();
+@@ -3074,9 +3188,14 @@ private:
+             if (m_flush) {
+                 continue;
+             }
+-            for (auto& picture : pictures) {
+-                const u64 pts = picture.pts;
+-                m_decoded.push_back({std::move(picture), pts, false});
++            for (size_t i = 0; i < pictures.size(); ++i) {
++                const u64 pts = pictures[i].pts;
++                const bool last = input.end && i + 1 == pictures.size();
++                if (!last && IsLate(pts)) {
++                    ++m_late_dropped;
++                    continue;
++                }
++                m_decoded.push_back({std::move(pictures[i]), pts, false});
+             }
+             if (input.end) {
+                 // The client stops at the frame marked end of stream; give it one even when the
+@@ -3275,6 +3394,13 @@ private:
+     bool m_end_queued{};
+     bool m_flush{};
+     bool m_quit{};
++    std::chrono::steady_clock::time_point m_last_take{};
++    u64 m_frame_us{1'000'000 / 60};
++    bool m_clock_running{};
++    std::chrono::steady_clock::time_point m_clock_start{};
++    std::chrono::steady_clock::time_point m_clock_last_take{};
++    u64 m_clock_start_pts{};
++    u64 m_late_dropped{};
+     std::thread m_worker;
+ };
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index bf5aaabb..0ff4dba7 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -282,8 +282,13 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+                                            device_addr_end_aligned - device_addr_start_aligned);
+     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
+-    // instead keep read traps and flush on demand.
+-    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
++    // instead keep read traps and flush on demand, unless EDEN_NX2_PREFLUSH=1 opts them into
++    // preflushing too (Ocarina of Time: far fewer Finish stalls, but some flicker).
++    static const bool nx2_preflush = [] {
++        const char* value = std::getenv("EDEN_NX2_PREFLUSH");
++        return value != nullptr && value[0] == '1';
++    }();
++    const bool preflush = nx2_preflush || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+     if (!area->preemtive) {
+         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
+             Nx2DownloadTrace::Marked(device_addr_start_aligned,
+@@ -835,8 +840,9 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+         }
+         ssbo_addr = holder + indirect_offset;
+     }
+-    channel_state->compute_storage_buffers[ssbo_index] = StorageBufferBinding(
+-        ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(), indirect_offset != ~0U);
++    channel_state->compute_storage_buffers[ssbo_index] =
++        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(),
++                             indirect_offset != ~0U, true);
+     if (indirect_offset != ~0U) {
+         TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
+                           channel_state->compute_storage_buffers[ssbo_index]);
+@@ -2937,7 +2943,8 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
+ 
+ template <class P>
+ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
+-                                             bool native_pointer, bool table_pointer) const {
++                                             bool native_pointer, bool table_pointer,
++                                             bool compute) const {
+     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+ 
+     if (gpu_addr == 0) {
+@@ -2958,8 +2965,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+     };
+     constexpr size_t ways = 4;
+     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
+-    const u32 flags =
+-        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U);
++    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
++                      (table_pointer ? 4U : 0U) | (compute ? 8U : 0U);
+     const size_t owner = gpu_memory->GetID() + 1;
+     const u64 serial = gpu_memory->MapSerial();
+     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
+@@ -3029,6 +3036,13 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         if (is_written) {
+             binding_size = aligned_size;
+         }
++        if constexpr (requires { runtime.GetMaxStorageBufferRange(); }) {
++            // A read-only pool's 256 MiB compute cap is above the 128 MiB every device
++            // guarantees. Only those are clamped, so no write is cut off.
++            if (table_pointer && !is_written) {
++                binding_size = (std::min)(binding_size, runtime.GetMaxStorageBufferRange());
++            }
++        }
+         return Binding{
+             .device_addr = *aligned_device_addr,
+             .gpu_addr = aligned_gpu_addr,
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 2afb361c..dbcd4222 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -602,7 +602,8 @@ private:
+ 
+     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
+                                                bool native_pointer = false,
+-                                               bool table_pointer = false) const;
++                                               bool table_pointer = false,
++                                               bool compute = false) const;
+ 
+     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
+                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index af8fca93..fc5f6253 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -472,9 +472,16 @@ void DmaPusher::CallMethod(u32 argument) {
+         const auto engine_type = subchannel_type[dma_state.subchannel];
+         const bool writer = split.Active() &&
+                             IsMemoryWriter(*subchannel, engine_type, dma_state.method);
++        // 2D blits and I2M uploads write guest memory at addresses the front doesn't track: macro
++        // DMA reads wait for them (Maxwell3D::FrontDmaRead).
++        const bool other_writer = split.Active() &&
++                                  (engine_type == Engines::EngineTypes::KeplerMemory ||
++                                   engine_type == Engines::EngineTypes::Fermi2D);
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++            } else if (other_writer) {
++                split.NoteMemoryWrite(0, ~u64{0}, "2D or I2M");
+             }
+         };
+         if (split.Active()) {
+@@ -530,9 +537,16 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+         const auto engine_type = subchannel_type[dma_state.subchannel];
+         const bool writer = split.Active() &&
+                             IsMemoryWriter(*subchannel, engine_type, dma_state.method);
++        // 2D blits and I2M uploads write guest memory at addresses the front doesn't track: macro
++        // DMA reads wait for them (Maxwell3D::FrontDmaRead).
++        const bool other_writer = split.Active() &&
++                                  (engine_type == Engines::EngineTypes::KeplerMemory ||
++                                   engine_type == Engines::EngineTypes::Fermi2D);
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++            } else if (other_writer) {
++                split.NoteMemoryWrite(0, ~u64{0}, "2D or I2M");
+             }
+         };
+         if (split.Active()) {
+diff --git a/src/video_core/engines/draw_manager.cpp b/src/video_core/engines/draw_manager.cpp
+index bd0b3b2c..b67f5363 100644
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include <cstring>
+ #include <set>
+ #include <tuple>
+@@ -15,6 +16,10 @@
+ #include "video_core/render_trace.h"
+ 
+ namespace Tegra::Engines {
++
++/// Draws the render-enable condition suppressed since the rasterizer last read it
++/// (EDEN_NX2_WATCH_SHADERS diagnostic, RasterizerVulkan::TickFrame).
++std::atomic<u32> g_nx2_suppressed_draws{0};
+ namespace {
+ 
+ void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
+@@ -345,6 +350,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
+     if (maxwell3d.ShouldExecute()) {
+         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+     } else {
++        g_nx2_suppressed_draws.fetch_add(1, std::memory_order_relaxed);
+         TraceSuppressedDraw(maxwell3d, false);
+     }
+ }
+@@ -356,6 +362,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
+     if (maxwell3d.ShouldExecute()) {
+         maxwell3d.rasterizer->DrawIndirect();
+     } else {
++        g_nx2_suppressed_draws.fetch_add(1, std::memory_order_relaxed);
+         TraceSuppressedDraw(maxwell3d, true);
+     }
+ }
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 29a9ceab..9158ca54 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -835,6 +835,13 @@ void Maxwell3D::ProcessQueryGet() {
+ }
+ 
+ void Maxwell3D::ProcessQueryCondition() {
++    // Diagnostic (EDEN_NX2_IGNORE_RENDER_ENABLE=1): run every draw, whatever the guest's
++    // render-enable condition says.
++    static const bool ignore_condition = std::getenv("EDEN_NX2_IGNORE_RENDER_ENABLE") != nullptr;
++    if (ignore_condition) {
++        execute_on = true;
++        return;
++    }
+     if (rasterizer->AccelerateConditionalRendering()) {
+         execute_on = true;
+         return;
+@@ -1045,6 +1052,11 @@ struct Maxwell3D::FrontState {
+     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
+     bool instance_loop{};
++    /// The inline upload being sent, when its words land linearly (FrontDmaRead).
++    bool upload_known{};
++    u64 upload_device{};
++    u32 upload_size{};
++    u32 upload_offset{};
+ };
+ 
+ namespace {
+@@ -1056,6 +1068,13 @@ bool FrontVerifyEnabled() {
+     return verify;
+ }
+ 
++// Methods whose execution on the back writes guest memory (inline uploads, reports).
++bool WritesGuestMemory(u32 method) {
++    return method == MAXWELL3D_REG_INDEX(launch_dma) ||
++           method == MAXWELL3D_REG_INDEX(inline_data) ||
++           method == MAXWELL3D_REG_INDEX(report_semaphore.query);
++}
++
+ // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
+ bool FrontHandledOutsideDrawManager(u32 method) {
+     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+@@ -1213,6 +1232,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+     } else {
+         split.Method(this, method, argument, is_last_call, nullptr);
+     }
++    if (WritesGuestMemory(method)) {
++        FrontNoteMemoryWrite(split, fs, method, &value, 1);
++    }
+ }
+ 
+ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+@@ -1320,6 +1342,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+         }
+     }
+     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
++    if (WritesGuestMemory(method) && amount != 0) {
++        FrontNoteMemoryWrite(split, fs, method, base_start, amount);
++    }
+ }
+ 
+ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
+@@ -1414,6 +1439,165 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool
+     return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
+ }
+ 
++void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
++                                     const u32* words, u32 count) {
++    const auto unknown = [&split](const char* what) { split.NoteMemoryWrite(0, ~u64{0}, what); };
++    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
++        constexpr u32 base = MAXWELL3D_REG_INDEX(report_semaphore);
++        const GPUVAddr address = (GPUVAddr{fs.regs[base]} << 32) | fs.regs[base + 1];
++        Regs::ReportSemaphore query_regs{};
++        query_regs.query.raw = words[count - 1];
++        const auto device = memory_manager.GpuToCpuAddress(address);
++        if (!device) {
++            return; // CounterReport writes nothing at an unmapped address.
++        }
++        // A short payload release is a fence: its payload is known.
++        if (query_regs.query.operation == Regs::ReportSemaphore::Operation::Release &&
++            query_regs.query.short_query != 0 &&
++            query_regs.query.report == Regs::ReportSemaphore::Report::Payload) {
++            const u32 payload = fs.regs[base + 2];
++            split.NoteMemoryWriteData(*device, &payload, 1);
++            split.NoteReportWrite(*device, 4);
++        } else {
++            // Counters and timed releases are written when the host query completes, not when
++            // the back runs them: reads of these bytes wait until the back ran the report and
++            // the host query completed.
++            split.NoteAsyncWrite(*device, 16);
++            split.NoteMemoryWrite(*device, 16, "3D report");
++        }
++        return;
++    }
++    constexpr u32 base = MAXWELL3D_REG_INDEX(upload);
++    if (method == MAXWELL3D_REG_INDEX(launch_dma)) {
++        const u64 line_length = fs.regs[base];
++        const u64 lines = (std::max)(fs.regs[base + 1], 1U);
++        const u64 pitch = (std::max<u64>)(fs.regs[base + 4], line_length);
++        const GPUVAddr address = (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3];
++        const u64 size = pitch * (lines - 1) + line_length;
++        const auto device = memory_manager.GpuToCpuAddress(address);
++        // LAUNCH_DMA: bit 0 pitch (linear) layout, bits 5:4 completion (2 releases a semaphore).
++        const u32 launch = words[count - 1];
++        const bool linear = (launch & 1) != 0;
++        if (((launch >> 4) & 3) == 2) {
++            unknown("upload release");
++        }
++        fs.upload_known = device && linear && lines == 1 && (*device & 3) == 0 &&
++                          memory_manager.GpuToCpuAddress(address + size - 1) ==
++                              *device + size - 1;
++        fs.upload_device = device.value_or(0);
++        fs.upload_size = static_cast<u32>((std::min<u64>)(size, ~0U));
++        fs.upload_offset = 0;
++        if (!fs.upload_known) {
++            if (!device || size == 0 || size > (u64{64} << 20)) {
++                return unknown("upload unmapped or huge");
++            }
++            split.NoteMemoryWrite(*device, size, "upload (not linear)");
++        }
++        return;
++    }
++    // inline_data words of the current upload.
++    if (!fs.upload_known) {
++        const auto device = memory_manager.GpuToCpuAddress(
++            (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3]);
++        if (!device) {
++            return unknown("upload data unmapped");
++        }
++        split.NoteMemoryWrite(*device, fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
++                                           u64{fs.regs[base + 4]} * fs.regs[base + 1],
++                              "upload data");
++        return;
++    }
++    const u32 remaining_bytes =
++        fs.upload_offset < fs.upload_size ? fs.upload_size - fs.upload_offset : 0;
++    const u32 whole = (std::min<u32>)(count, remaining_bytes / 4);
++    split.NoteMemoryWriteData(fs.upload_device + fs.upload_offset, words, whole);
++    if (whole < count && remaining_bytes % 4 != 0) {
++        split.NoteMemoryWrite(fs.upload_device + fs.upload_offset + whole * 4, remaining_bytes % 4);
++    }
++    fs.upload_offset += (std::min<u32>)(count * 4, remaining_bytes);
++}
++
++bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
++                                   u32 method, GPUVAddr source, u32 words) {
++    // Without draining the back, for reads of report memory only (pages 3D reports and
++    // semaphore releases write, such as occlusion results): the words in guest memory, with the
++    // queued writes the front knows the words of on top (fence releases, inline uploads), once
++    // the back ran the queued writes it doesn't know that overlap the read. Other memory may be
++    // written by queued draws or dispatches the front doesn't track; pages GPU shaders or copies
++    // wrote, and counter reports whose host query hasn't completed, take the drained path too.
++    const size_t read_bytes = size_t{words} * sizeof(u32);
++    if (words == 0) {
++        return false;
++    }
++    const auto device = memory_manager.GpuToCpuAddress(source);
++    if (!device || !split.IsReportMemory(*device, read_bytes)) {
++        return false;
++    }
++    // Every page where a contiguous device range puts it: the queued-write checks look at
++    // [*device, *device + read_bytes).
++    for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
++        const GPUVAddr at = (std::max)(page, source);
++        const auto page_device = memory_manager.GpuToCpuAddress(at);
++        if (!page_device || *page_device != *device + (at - source) ||
++            Tegra::Nx2IsGpuWritten(*page_device)) {
++            return false;
++        }
++    }
++    if (const u64 async_position = split.HasAsyncWrite(*device, read_bytes);
++        async_position != 0 && (async_position > split.ConsumedNow() ||
++                                !Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
++        return false;
++    }
++    thread_local std::vector<u32> fast;
++    fast.resize(words);
++    const u64 since = split.ConsumedNow();
++    memory_manager.ReadBlockUnsafe(source, fast.data(), read_bytes);
++    if (!split.OverlayQueuedWrites(since, *device, fast.data(), words)) {
++        if (!split.WaitForWritesTo(*device, read_bytes)) {
++            return false;
++        }
++        memory_manager.ReadBlockUnsafe(source, fast.data(), read_bytes);
++    }
++    // EDEN_NX2_DMA_READ_CHECK=1: also drain, read again and log reads that differ.
++    static const bool check = std::getenv("EDEN_NX2_DMA_READ_CHECK") != nullptr;
++    if (check) [[unlikely]] {
++        static u64 checks{};
++        static u64 differences{};
++        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++        if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
++            split.Run(
++                [memory = &memory_manager, source, read_bytes] {
++                    memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++                },
++                VideoCommon::DrainSite::MacroDmaFlush);
++        }
++        std::vector<u32> exact(words);
++        memory_manager.ReadBlockUnsafe(source, exact.data(), read_bytes);
++        ++checks;
++        if (exact != fast) {
++            if (differences++ < 16) {
++                LOG_WARNING(HW_GPU,
++                            "DMA read check: macro {:#x} read of {} words at {:#x} differs from "
++                            "the drained read",
++                            macro, words, source);
++            }
++            fast = std::move(exact);
++        }
++        if ((checks & 0xffff) == 0) {
++            LOG_INFO(HW_GPU, "DMA read check: {} reads, {} differed", checks, differences);
++        }
++    }
++    const u32 ram = fs.regs[0x156];
++    for (u32 i = 0; i < words; ++i) {
++        if (method == 0x158) {
++            fs.parameters.push_back(fast[i]);
++        } else if (ram + i < native_data_ram.size()) {
++            native_data_ram[ram + i] = fast[i];
++        }
++    }
++    return true;
++}
++
+ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
+                              u32 method, u32 count) {
+     // The words may be written by methods still queued for the back (indirect draw arguments
+@@ -1428,6 +1612,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
+     }
+     VideoCommon::Nx2Profile::CountDmaRead(macro);
++    // Experiment (EDEN_NX2_DMA_EARLY=0): always drain, as before the early reads.
++    static const bool early_reads = [] {
++        const char* const value = std::getenv("EDEN_NX2_DMA_EARLY");
++        return value == nullptr || value[0] != '0';
++    }();
++    if (early_reads && diag_before.empty() &&
++        FrontDmaReadQueued(split, fs, macro, method, source, words)) {
++        return;
++    }
+     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+     if (VideoCommon::QueryDma::TraceEnabled()) {
+         split.Run(
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 97790bbc..7ccd5344 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3403,6 +3403,11 @@ private:
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
+     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
++    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
++                              const u32* words, u32 count);
++    /// FrontDmaRead without draining the back, when the words can be known: false otherwise.
++    bool FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
++                            GPUVAddr source, u32 words);
+     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                       u32 count);
+     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 8fb6a43f..24962789 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -11,6 +11,8 @@
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "core/core.h"
++#include <optional>
++
+ #include "video_core/nx2_profile.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dma_pusher.h"
+@@ -22,6 +24,8 @@
+ #include "video_core/engines/puller.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
++#include "video_core/host1x/host1x.h"
++#include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
+ #include "video_core/rasterizer_interface.h"
+@@ -92,6 +96,26 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     // The release may still be queued for the split GPU thread's back half (and the caches
+     // ReadSemaphoreWord asks are its state).
+     DrainBack();
++    if (pending_acquire->syncpoint) {
++        // Raised when the GPU thread runs the other channel's increment, so its earlier work
++        // is recorded ahead of what this channel runs next.
++        const u32 reached = dma_pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
++            *pending_acquire->syncpoint);
++        if (static_cast<s32>(reached - pending_acquire->value) >= 0) {
++            return true;
++        }
++        // Never stall the game on a wait that emulation can't meet: give up after a while.
++        if (std::chrono::steady_clock::now() - pending_acquire->since >
++            std::chrono::milliseconds{250}) {
++            if (static std::atomic<u32> given_up{}; given_up.fetch_add(1) < 16) {
++                LOG_WARNING(HW_GPU, "Channel {} stopped waiting for syncpoint {} >= {} (at {})",
++                            dma_pusher.channel_state.bind_id, *pending_acquire->syncpoint,
++                            pending_acquire->value, reached);
++            }
++            return true;
++        }
++        return false;
++    }
+     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+         if (static std::atomic<u32> rescued{};
+@@ -194,12 +218,38 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
+ 
+ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+     switch (regs.fence_action.op) {
+-    case Puller::FenceOperation::Acquire:
+-        // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
+-        // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
++    case Puller::FenceOperation::Acquire: {
+         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+         VideoCommon::GpuSplit::Get().NoteSync();
++        // A queue waiting on another queue's sync object (Ocarina's final pass waits for the
++        // channel that draws its HUD). Running on without the wait recorded the final pass
++        // before the HUD draws on some frames, and the minimap, hearts and dialogs vanished.
++        // Suspend the channel until the other channel's work has raised the syncpoint.
++        // EDEN_NX2_FENCE_WAIT=0 runs on as before.
++        static const bool fence_wait = [] {
++            const char* const value = std::getenv("EDEN_NX2_FENCE_WAIT");
++            return value == nullptr || value[0] != '0';
++        }();
++        const u32 id = regs.fence_action.syncpoint_id;
++        if (fence_wait && g_nx2_ampere &&
++            id < Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
++            DrainBack();
++            const u32 reached =
++                dma_pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(id);
++            if (static_cast<s32>(reached - regs.fence_value) < 0) {
++                pending_acquire = PendingAcquire{
++                    .address = 0,
++                    .value = regs.fence_value,
++                    .operation = 0,
++                    .since = std::chrono::steady_clock::now(),
++                    .reported = false,
++                    .syncpoint = id,
++                };
++                dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
++            }
++        }
+         break;
++    }
+     case Puller::FenceOperation::Increment:
+         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
+             rasterizer->SignalSyncPoint(id);
+@@ -211,6 +261,7 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+     }
+ }
+ 
++
+ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+     const auto semaphoreOperationMask = 0xF;
+     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
+@@ -362,6 +413,25 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+     }
+ }
+ 
++// A semaphore release queued for the split's back: the front's macro DMA reads of those bytes
++// wait for it (Maxwell3D::FrontDmaRead).
++// A fence release (`fence_payload`): reads overlay its payload while it is queued.
++static void NoteSemaphoreWrite(DmaPusher& dma_pusher, GPUVAddr address,
++                               std::optional<u32> fence_payload) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
++    if (!device) {
++        return; // Queries write nothing at an unmapped address.
++    } else if (fence_payload) {
++        split.NoteMemoryWriteData(*device, &*fence_payload, 1);
++        split.NoteReportWrite(*device, 4);
++    } else {
++        // Written when its fence is signalled: reads wait until the back ran it and it was.
++        split.NoteAsyncWrite(*device, 16);
++        split.NoteMemoryWrite(*device, 16, "semaphore (timed)");
++    }
++}
++
+ /// Calls a GPU puller method.
+ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
+     static const bool nx2_trace = std::getenv("EDEN_NX2_PULLER_TRACE") != nullptr;
+@@ -396,6 +466,12 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+         break;
+     case BufferMethods::SemaphoreOperation: {
+         ProcessSemaphoreTriggerMethod(dma_pusher);
++        if (static_cast<GpuSemaphoreOperation>(regs.semaphore_trigger & 0xF) ==
++            GpuSemaphoreOperation::WriteLong) {
++            const bool fence = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0;
++            NoteSemaphoreWrite(dma_pusher, regs.semaphore_address.SemaphoreAddress(),
++                               fence ? std::optional<u32>{regs.semaphore_sequence} : std::nullopt);
++        }
+         break;
+     }
+     case BufferMethods::NonStallInterrupt: {
+@@ -429,6 +505,15 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+         } else {
+             ProcessSemaphoreRelease(dma_pusher);
+         }
++        if (g_nx2_ampere && (method_call.argument & 7) == 1) {
++            NoteSemaphoreWrite(dma_pusher,
++                               (GPUVAddr{regs.reg_array[0x18] & 0x1FFFFFF} << 32) |
++                                   (regs.reg_array[0x17] & ~3U),
++                               regs.reg_array[0x19]);
++        } else if (!g_nx2_ampere) {
++            NoteSemaphoreWrite(dma_pusher, regs.semaphore_address.SemaphoreAddress(),
++                               std::nullopt);
++        }
+         break;
+     }
+     case BufferMethods::Yield: {
+diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
+index 2b9e2c5d..776578b9 100644
+--- a/src/video_core/engines/puller.h
++++ b/src/video_core/engines/puller.h
+@@ -72,13 +72,15 @@ public:
+         BitField<8, 24, u32> syncpoint_id;
+     };
+ 
+-    /// Switch 2: a semaphore acquire this channel is suspended on.
++    /// Switch 2: a semaphore acquire this channel is suspended on, or (syncpoint set) a fence
++    /// acquire waiting for another channel to raise that syncpoint to value.
+     struct PendingAcquire {
+         GPUVAddr address;
+         u32 value;
+         u32 operation;
+         std::chrono::steady_clock::time_point since;
+         bool reported;
++        std::optional<u32> syncpoint{};
+ 
+         [[nodiscard]] bool Matches(u32 current) const;
+     };
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index c1378113..0eb28dad 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -140,6 +140,9 @@ void GpuSplit::Stop() {
+     ring.reset();
+     write_position = 0;
+     last_writer_position = 0;
++    pending_write_count = 0;
++    async_writes.clear();
++    report_pages.clear();
+     last_sync_position = 0;
+     published_local = 0;
+     consumed_cache = 0;
+@@ -222,6 +225,86 @@ bool GpuSplit::WaitForWriters() {
+     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+ }
+ 
++bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
++    consumed_cache = consumed.load(std::memory_order_acquire);
++    const u64 end = begin + size;
++    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
++    u64 target = 0;
++    u64 scanned = 0;
++    for (; scanned < remembered; ++scanned) {
++        const PendingWrite& write =
++            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
++        if (write.position <= consumed_cache) {
++            break;
++        }
++        if (write.begin < end && begin < write.end) {
++            target = (std::max)(target, write.position);
++        }
++    }
++    if (scanned == pending_writes.size()) {
++        return false;
++    }
++    if (target != 0) {
++        WaitFor(target, DrainSite::MacroDmaRead);
++    }
++    return true;
++}
++
++bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
++    consumed_cache = consumed.load(std::memory_order_acquire);
++    const u64 end = begin + size;
++    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
++    for (u64 scanned = 0; scanned < remembered; ++scanned) {
++        const PendingWrite& write =
++            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
++        if (write.position <= consumed_cache) {
++            return false;
++        }
++        if (write.begin < end && begin < write.end) {
++            return true;
++        }
++    }
++    return remembered == pending_writes.size();
++}
++
++bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
++    if ((begin & 3) != 0) {
++        return false;
++    }
++    const u64 end = begin + u64{words} * sizeof(u32);
++    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
++    // Newest first, back to what the back had consumed before guest memory was read.
++    std::array<u32, 64> overlapping;
++    u32 found = 0;
++    u64 scanned = 0;
++    for (; scanned < remembered; ++scanned) {
++        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
++        const PendingWrite& write = pending_writes[index];
++        if (write.position <= since) {
++            break;
++        }
++        if (write.begin < end && begin < write.end) {
++            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
++                return false;
++            }
++            overlapping[found++] = static_cast<u32>(index);
++        }
++    }
++    if (scanned == pending_writes.size()) {
++        return false;
++    }
++    for (u32 i = found; i-- > 0;) {
++        const PendingWrite& write = pending_writes[overlapping[i]];
++        for (u32 w = 0; w < write.words; ++w) {
++            const u64 address = write.begin + u64{w} * sizeof(u32);
++            if (address >= begin && address < end) {
++                out[(address - begin) / sizeof(u32)] = write.data[w];
++            }
++        }
++    }
++    return true;
++}
++
+ bool GpuSplit::WaitForSync() {
+     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
+ }
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 2e9250ff..76027dbc 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <cstring>
+@@ -10,6 +11,8 @@
+ #include <memory>
+ #include <thread>
+ #include <type_traits>
++#include <unordered_map>
++#include <unordered_set>
+ 
+ #include "common/common_types.h"
+ 
+@@ -165,6 +168,85 @@ public:
+     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+     /// Returns whether any of it was still queued.
+     bool WaitForWriters();
++    /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
++    /// report, a semaphore release). size ~0 means an unknown range.
++    void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
++        PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
++        write.what = what;
++        write.begin = begin;
++        write.end = size == ~u64{0} ? ~u64{0} : begin + size;
++        write.position = write_position;
++        write.words = 0;
++    }
++    /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
++    /// linear inline upload data): reads overlay them instead of waiting.
++    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
++        while (words != 0) {
++            const u32 count = (std::min<u32>)(words, PendingWriteWords);
++            PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
++            write.what = "known";
++            write.begin = begin;
++            write.end = begin + u64{count} * sizeof(u32);
++            write.position = write_position;
++            write.words = count;
++            std::memcpy(write.data.data(), data, count * sizeof(u32));
++            begin += u64{count} * sizeof(u32);
++            data += count;
++            words -= count;
++        }
++    }
++    /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
++    [[nodiscard]] u64 ConsumedNow() {
++        return consumed.load(std::memory_order_acquire);
++    }
++    /// Applies to `out` (the words at device address `begin`, read from guest memory after
++    /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
++    /// overlapping queued write's words are unknown (the caller waits instead).
++    bool OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words);
++    /// Waits until the back executed the noted writes that overlap [begin, begin + size).
++    /// Returns false when more writes are queued than are remembered (the caller drains).
++    bool WaitForWritesTo(u64 begin, u64 size);
++    /// Whether a noted write that overlaps [begin, begin + size) is still queued (or too many
++    /// are queued to tell).
++    bool HasQueuedWritesTo(u64 begin, u64 size);
++    /// Front: a write that lands when a host query completes or a fence signals (counter
++    /// reports, timed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
++    void NoteAsyncWrite(u64 begin, u64 size) {
++        NoteReportWrite(begin, size);
++        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
++            async_writes[slot] = write_position;
++        }
++    }
++    /// Front: whether these bytes lie on 4 KiB pages reports or semaphore releases write (query
++    /// and semaphore pools), which draws and dispatches don't write.
++    [[nodiscard]] bool IsReportMemory(u64 begin, u64 size) const {
++        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
++            if (!report_pages.contains(page)) {
++                return false;
++            }
++        }
++        return true;
++    }
++    /// Front: a report or semaphore release was sent to these bytes.
++    void NoteReportWrite(u64 begin, u64 size) {
++        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
++            report_pages.insert(page);
++        }
++    }
++    /// Front: the ring position of the newest async write noted to these bytes, or 0.
++    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
++        u64 newest = 0;
++        if (async_writes.empty()) {
++            return newest;
++        }
++        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
++            if (const auto it = async_writes.find(slot); it != async_writes.end()) {
++                newest = (std::max)(newest, it->second);
++            }
++        }
++        return newest;
++    }
++
+     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
+     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
+     /// commands after it are fetched.
+@@ -189,6 +271,9 @@ private:
+     static constexpr u64 HasSegment = 1 << 5;
+     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+ 
++    std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
++    std::unordered_set<u64> report_pages;      ///< Front: 4 KiB pages reports and releases wrote
++
+     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
+     static constexpr size_t RingMask = RingWords - 1;
+     static constexpr u32 MaxMultiWords = 8192;
+@@ -246,6 +331,17 @@ private:
+     // Front side.
+     u64 write_position{};
+     u64 last_writer_position{};
++    static constexpr u32 PendingWriteWords = 8;
++    struct PendingWrite {
++        u64 begin;
++        u64 end;
++        u64 position;
++        u32 words; ///< Known words from begin, or 0 (unknown contents)
++        const char* what;
++        std::array<u32, PendingWriteWords> data;
++    };
++    std::array<PendingWrite, 8192> pending_writes{};
++    u64 pending_write_count{};
+     u64 last_sync_position{};
+     u64 published_local{};
+     u64 consumed_cache{};
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index e85e6142..6288eb5e 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -85,6 +85,28 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
+ }
+ 
+ /// A new emulation session starts: no page has been written by its GPU yet.
++// Query results written when their host work completes (counter reports): per 16-byte slot
++// hash, how many the back issued and how many completed. Equal counts mean the words in memory
++// are final, so the split's front can read them without draining the back.
++inline constexpr u64 Nx2AsyncReportSlots = u64{1} << 16;
++inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_issued{};
++inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_completed{};
++
++[[nodiscard]] inline u64 Nx2AsyncReportSlot(u64 device_address) {
++    return (device_address >> 4) % Nx2AsyncReportSlots;
++}
++
++[[nodiscard]] inline bool Nx2AsyncReportsSettled(u64 device_address, u64 size) {
++    for (u64 slot = device_address >> 4; slot <= (device_address + size - 1) >> 4; ++slot) {
++        const u64 index = slot % Nx2AsyncReportSlots;
++        if (g_nx2_async_reports_completed[index].load(std::memory_order_acquire) !=
++            g_nx2_async_reports_issued[index].load(std::memory_order_acquire)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ inline void Nx2ClearGpuWrittenPages() {
+     for (auto& word : g_nx2_gpu_written_pages) {
+         word.store(0, std::memory_order_relaxed);
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index efa148bf..71f25fca 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -286,6 +286,13 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+                                      pointer, pointer_timestamp, cpu_addr, addr,
+                                      asid = gpu_memory->GetID(), counter_type] {
++        struct Settle {
++            DAddr address;
++            ~Settle() {
++                Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(address)].fetch_add(
++                    1, std::memory_order_release);
++            }
++        } const settle{cpu_addr};
+         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
+                 LOG_INFO(HW_GPU,
+@@ -339,6 +346,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+         }
+     });
+     if (is_fence) {
++        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
++            1, std::memory_order_release);
+         impl->rasterizer.SignalFence(std::move(operation));
+     } else {
+         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+@@ -362,6 +371,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+             streamer->Free(new_query_id);
+             return;
+         }
++        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
++            1, std::memory_order_release);
+         impl->rasterizer.SyncOperation(std::move(operation));
+     }
+     if (is_synced) {
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+index 5a9ac4a9..8a515199 100644
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -788,6 +788,58 @@ void BlitImageHelper::BlitColor(const Framebuffer* dst_framebuffer, VkImageView
+     };
+     const VkPipelineLayout layout = *one_texture_pipeline_layout;
+     const VkPipeline pipeline = FindOrEmplaceColorPipeline(key);
++    // Draw texture (guest HUD sprites) runs between the guest's draws. Its own render pass left
++    // the scheduler's tracked pipeline, descriptors and viewport stale, so the next draw could
++    // run with the blit's (Ocarina's minimap and dialogs vanished on some frames), ended
++    // without the end-of-pass barrier, and left the source in SHADER_READ_ONLY_OPTIMAL while
++    // everything else assumes GENERAL. Draw it like BlitImpl does instead.
++    // EDEN_NX2_DRAW_TEXTURE_OLD=1 keeps the previous path, for comparisons.
++    static const bool old_path = [] {
++        const char* const value = std::getenv("EDEN_NX2_DRAW_TEXTURE_OLD");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (!old_path) {
++        scheduler.RequestOutsideRenderPassOperationContext();
++        scheduler.Record([src_image](vk::CommandBuffer cmdbuf) {
++            const VkImageMemoryBarrier barrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                 VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = src_image,
++                .subresourceRange{
++                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .baseMipLevel = 0,
++                    .levelCount = VK_REMAINING_MIP_LEVELS,
++                    .baseArrayLayer = 0,
++                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
++                },
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, barrier);
++        });
++        scheduler.RequestRenderpass(dst_framebuffer);
++        scheduler.Record([this, src_image_view, src_sampler, dst_region, src_region, src_size,
++                          pipeline, layout](vk::CommandBuffer cmdbuf) {
++            const VkDescriptorSet descriptor_set = one_texture_descriptor_allocator.Commit();
++            UpdateOneTextureDescriptorSet(device, descriptor_set, src_sampler, src_image_view);
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, descriptor_set,
++                                      nullptr);
++            BindBlitState(cmdbuf, layout, dst_region, src_region, src_size);
++            cmdbuf.Draw(3, 1, 0, 0);
++        });
++        scheduler.InvalidateState();
++        return;
++    }
+     // Read the framebuffer now: the texture cache's framebuffer slots can move before the
+     // worker records this.
+     const VkRenderPass render_pass = dst_framebuffer->RenderPass();
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index 0a1b8bb4..215ceb61 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -286,6 +286,10 @@ public:
+         return max_dynamic_storage_buffers;
+     }
+ 
++    u32 GetMaxStorageBufferRange() const {
++        return static_cast<u32>(device.GetMaxStorageBufferRange());
++    }
++
+ private:
+     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
+         const VkBuffer handle = buffer.Handle();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 8fe469ac..8daef31e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -74,6 +74,10 @@
+ #include "video_core/nx2_debug_control.h"
+ #include "video_core/nx2_profile.h"
+ 
++namespace Tegra::Engines {
++extern std::atomic<u32> g_nx2_suppressed_draws;
++}
++
+ namespace Vulkan {
+ 
+ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
+@@ -83,6 +87,27 @@ using VideoCommon::ImageViewType;
+ 
+ namespace {
+ 
++/// Diagnostic (EDEN_NX2_WATCH_SHADERS=<hash>,...): logs, per presented frame, how many draws ran
++/// with one of these shaders and how many draws the render-enable condition suppressed.
++const std::vector<u64>& WatchedShaders() {
++    static const std::vector<u64> hashes = [] {
++        std::vector<u64> result;
++        const char* value = std::getenv("EDEN_NX2_WATCH_SHADERS");
++        while (value != nullptr && *value != '\0') {
++            char* end = nullptr;
++            const u64 hash = std::strtoull(value, &end, 16);
++            if (end == value) {
++                break;
++            }
++            result.push_back(hash);
++            value = *end == ',' ? end + 1 : end;
++        }
++        return result;
++    }();
++    return hashes;
++}
++std::atomic<u32> g_watched_draws{0};
++
+ /// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
+ /// read as the GPU reads it, without flushing GPU caches.
+ VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager* const> spaces,
+@@ -595,6 +620,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
+     if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+         TrackOotTonemappedImage(*pipeline);
+     }
++    if (const auto& watched = WatchedShaders(); !watched.empty()) {
++        for (const u64 hash : pipeline->ShaderHashes()) {
++            if (hash != 0 && std::ranges::find(watched, hash) != watched.end()) {
++                g_watched_draws.fetch_add(1, std::memory_order_relaxed);
++                break;
++            }
++        }
++    }
+     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
+     mesh_draw = pipeline->IsMeshPipeline();
+     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
+@@ -2750,6 +2783,12 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
+ }
+ 
+ void RasterizerVulkan::TickFrame() {
++    if (!WatchedShaders().empty()) {
++        static u64 watch_frame{};
++        LOG_INFO(Render_Vulkan, "Watch frame {}: {} watched draws, {} draws suppressed",
++                 ++watch_frame, g_watched_draws.exchange(0, std::memory_order_relaxed),
++                 Tegra::Engines::g_nx2_suppressed_draws.exchange(0, std::memory_order_relaxed));
++    }
+     if (VideoCore::Nx2Debug::HasRequests()) {
+         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 19bbcd96..293effd0 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -38,6 +38,27 @@
+ namespace Vulkan {
+ 
+ namespace {
++/// Experiment (EDEN_NX2_RP_BARRIER=1): a full memory barrier before every render pass begins and
++/// after it ends, the serialization the frame dump's per-pass readbacks give.
++bool FullRenderPassBarriers() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_RP_BARRIER");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++void RecordFullBarrier(vk::CommandBuffer cmdbuf) {
++    static constexpr VkMemoryBarrier FULL_BARRIER{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++    };
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           0, FULL_BARRIER);
++}
++
+ std::atomic<u64> g_profile_submits{};
+ std::atomic<u64> g_profile_renderpasses{};
+ std::atomic<u64> g_profile_finishes{};
+@@ -322,8 +343,11 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+         values[i] = clear_values[i];
+     }
+     const bool after_compute = std::exchange(compute_writes_pending, false);
+-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
+-            after_compute](vk::CommandBuffer cmdbuf) {
++    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count, after_compute,
++            full_barrier = FullRenderPassBarriers()](vk::CommandBuffer cmdbuf) {
++        if (full_barrier) {
++            RecordFullBarrier(cmdbuf);
++        }
+         const VkRenderPassBeginInfo renderpass_bi{
+             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+             .pNext = nullptr,
+@@ -892,7 +916,8 @@ void Scheduler::EndRenderPass()
+         Record([num_images = num_renderpass_images,
+                        images = renderpass_images,
+                        ranges = renderpass_image_ranges,
+-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
++                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
++                       full_barrier = FullRenderPassBarriers()](
+                           vk::CommandBuffer cmdbuf) {
+             std::array<VkImageMemoryBarrier, 9> barriers;
+             for (size_t i = 0; i < num_images; ++i) {
+@@ -944,6 +969,9 @@ void Scheduler::EndRenderPass()
+                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        0, XFB_OUTPUT_BARRIER);
+             }
++            if (full_barrier) {
++                RecordFullBarrier(cmdbuf);
++            }
+         });
+ 
+         state.renderpass = VkRenderPass{};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 93db2058..084c3439 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -266,10 +266,16 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+ 
+ template <class P>
+ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+-    // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
+-    // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
+-    // MaxCriticalMemory on rather than near the card's budget.
+-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
++    // Past what a frame needs, more device memory only keeps the textures of earlier scenes
++    // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
++    // MaxCriticalMemory on rather than near the card's budget. Larger cards get 5/8 of the
++    // driver's budget (GetDeviceLocalMemory is capped near 7 GiB): at 5 GiB title 1's races
++    // recreate and upload ~8 MiB of render targets a frame (16 GB card: 53 -> 59 fps at 10 GiB).
++    u64 max_critical = MaxCriticalMemory;
++    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
++        max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
++    }
++    critical_memory = (std::min)(critical_memory, max_critical);
+     expected_memory =
+         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+     minimum_memory =
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index a010e29a..c05283b1 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -151,8 +151,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+ 
+     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
+     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
+-    /// The most device memory the collector lets the cache fill before it collects in earnest,
+-    /// on every GPU (ApplyThresholdOverrides).
++    /// The most device memory the collector lets the cache fill before it collects in earnest on
++    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
+     static constexpr u64 MaxCriticalMemory = 5_GiB;
+     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
+ 
+-- 
+2.43.0
+
