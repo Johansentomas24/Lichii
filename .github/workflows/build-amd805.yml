@@ -1,0 +1,215 @@
+name: build-amd805
+
+# Compila Lichii nx2 + PR #805 (jpkto: hilos de GPU desacoplados) + los arreglos de Lichii-AMD:
+# copia de oclusion sin espera (f46553af), pipelines por presupuesto, heavy skip, RP_BARRIER y
+# draw texture. Solo sube los binarios de Windows como artifacts.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 894a9e838692fdbd5b7c3dfec78e1ab366f48b20
+  BASE_TAG: build-805amd
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} binary
+    runs-on: ${{ matrix.runner }}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 3G
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2022
+          - platform: windows-x86_64-pgo
+            runner: windows-2022
+            pgo: true
+            profile: lichii-windows.profdata
+
+    steps:
+      - name: Check out PR 805 + AMD patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q .
+          git config user.name "build"
+          git config user.email "build@localhost"
+          git fetch -q --depth 1 https://github.com/zortos293/Lichii.git ${BASE_SHA} || git fetch -q --depth 1 https://github.com/jpkto/Lichii.git ${BASE_SHA}
+          git checkout -q -B src ${BASE_SHA}
+          git fetch -q --depth 1 https://github.com/${GITHUB_REPOSITORY}.git ${GITHUB_SHA}
+          git show FETCH_HEAD:patches/amd805.patch > "$RUNNER_TEMP/amd.patch"
+          git am --keep-cr "$RUNNER_TEMP/amd.patch"
+          git log --oneline -4
+
+      # The profiles are in the source tree, where the Linux and Windows configure steps read them.
+      - name: Check PGO profile
+        if: matrix.pgo
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "${{ matrix.profile || 'eglantine.profdata' }}"
+
+      - name: Set up MSVC
+        if: startsWith(matrix.platform, 'windows')
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # clang-cl compiles against the MSVC headers, libraries and SDK that the previous step put
+      # on PATH; only the compiler, linker and archiver come from this LLVM.
+      - name: Install LLVM on Windows
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt on Windows
+        if: startsWith(matrix.platform, 'windows')
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      # ccache does not handle MSVC-style command lines well, so the clang-cl job uses sccache. The
+      # other jobs use ccache, which CMake enables through USE_CCACHE
+      # (externals/cmake-modules/UseCcache.cmake).
+      - name: Install sccache on Windows
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK on Windows
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Verify Vulkan tools on Windows
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: glslangValidator --version
+
+      - name: Restore CPM downloads
+        id: cpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-${{ matrix.platform }}-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-${{ matrix.platform }}-v2-
+            cpm-${{ runner.os }}-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .ccache
+            .sccache
+          # The profile's hash is part of the key, so objects built against an older profile are
+          # never restored.
+          key: objects-${{ matrix.platform }}${{ matrix.profile && format('-{0}', hashFiles(matrix.profile)) || '' }}-v2-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-${{ matrix.platform }}${{ matrix.profile && format('-{0}', hashFiles(matrix.profile)) || '' }}-v2-${{ github.sha }}-
+            objects-${{ matrix.platform }}${{ matrix.profile && format('-{0}', hashFiles(matrix.profile)) || '' }}-v2-
+
+      # A profile older than the source only warns: functions changed since training lose their
+      # profile data and are optimized as in the ThinLTO build. clang-cl 22 reads LLVM's indexed
+      # profile format 13, so the profile must come from the LLVM that tools/windows installs.
+      - name: Configure Windows
+        if: startsWith(matrix.platform, 'windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
+          if [ -n '${{ matrix.profile }}' ]; then
+            flags+=" -fprofile-use=$(cygpath -m "$PWD/${{ matrix.profile }}")"
+            flags+=" -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled"
+            flags+=" -Wno-error=backend-plugin"
+          fi
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DLICHII_BUILD_TAG=${BASE_TAG} \
+            -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=$flags" \
+            "-DCMAKE_CXX_FLAGS=-EHsc $flags"
+
+      - name: Save CPM downloads
+        if: steps.cpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        shell: bash
+        run: |
+          if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
+          targets="yuzu yuzu-cmd"
+          if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater"; fi
+          cmake --build build/release --target $targets --parallel
+          if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
+
+      - name: Stop sccache on Windows
+        if: always() && startsWith(matrix.platform, 'windows') && steps.compiler-cache.outcome == 'success'
+        shell: pwsh
+        run: sccache --stop-server
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .ccache
+            .sccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Package Windows binary
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: |
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$exe")) {
+              throw "build/release/bin/$exe was not produced"
+            }
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+
+      # The artifact is the bin folder itself: GitHub zips artifacts on download, and uploading a
+      # zip gave a zip inside a zip. The release job zips it once for the release.
+      - name: Upload Windows binary
+        if: startsWith(matrix.platform, 'windows')
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-amd805-${{ matrix.platform }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 7
